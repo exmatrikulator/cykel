@@ -3,10 +3,16 @@ from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import D
 from django.contrib.sites.shortcuts import get_current_site
-from django.utils.timezone import now
+from django.utils.timezone import now, timedelta
 from preferences import preferences
 from rest_framework import exceptions, generics, mixins, status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.authentication import SessionAuthentication, TokenAuthentication
+from rest_framework.decorators import (
+    action,
+    api_view,
+    authentication_classes,
+    permission_classes,
+)
 from rest_framework.permissions import (
     SAFE_METHODS,
     AllowAny,
@@ -18,11 +24,13 @@ from rest_framework.views import exception_handler
 from rest_framework_api_key.permissions import HasAPIKey
 
 from bikesharing.models import Bike, Location, LocationTracker, Rent, Station
+from cykel.models import CykelLogEntry
 
 from .serializers import (
     BikeSerializer,
     CreateRentSerializer,
     LocationTrackerUpdateSerializer,
+    MaintenanceBikeSerializer,
     RentSerializer,
     SocialAppSerializer,
     StationSerializer,
@@ -55,6 +63,17 @@ class CanRentBikePermission(BasePermission):
         return request.user.has_perm("bikesharing.add_rent")
 
 
+class CanUseMaintenancePermission(BasePermission):
+    """The request is authenticated as a user and has maintenance
+    permission."""
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        return request.user.has_perm("bikesharing.maintain")
+
+
 @permission_classes([IsAuthenticated, CanRentBikePermission])
 class RentViewSet(
     mixins.CreateModelMixin,
@@ -78,7 +97,7 @@ class RentViewSet(
             return resp
         # override output with RentSerializer
         rent = self.get_queryset().get(id=resp.data["id"])
-        serializer = RentSerializer(rent)
+        serializer = RentSerializer(rent, context={"request": request})
         headers = self.get_success_headers(serializer.data)
         return Response(
             serializer.data, status=status.HTTP_201_CREATED, headers=headers
@@ -101,18 +120,41 @@ class RentViewSet(
                 {"error": "rent was already finished"}, status=status.HTTP_410_GONE
             )
 
-        end_position = None
+        end_location = None
         if lat and lng:
-            loc = Location.objects.create(
-                bike=rent.bike, source="US", reported_at=now()
+            end_location = Location.objects.create(
+                bike=rent.bike,
+                source=Location.Source.USER,
+                reported_at=now(),
+                geo=Point(float(lng), float(lat), srid=4326),
             )
-            loc.geo = Point(float(lng), float(lat), srid=4326)
-            loc.save()
-            end_position = loc.geo
 
-        rent.end(end_position)
+        rent.end(end_location)
 
         return Response({"success": True})
+
+    @action(detail=True, methods=["post"])
+    def unlock(self, request, pk=None):
+        rent = self.get_object()
+
+        if rent.user != request.user:
+            return Response(
+                {"error": "rent belongs to another user"},
+                status=status.HTTP_403_PERMISSON_DENIED,
+            )
+
+        if rent.rent_end is not None:
+            return Response(
+                {"error": "rent was already finished"}, status=status.HTTP_410_GONE
+            )
+
+        try:
+            data = rent.unlock()
+        except Exception as e:
+            print(e)
+            return Response({"success": False})
+
+        return Response({"success": True, "data": data})
 
 
 @api_view(["POST"])
@@ -138,11 +180,14 @@ def updatebikelocation(request):
     loc = None
 
     if lat and lng:
-        loc = Location.objects.create(source="TR", reported_at=now())
+        loc = Location(
+            source=Location.Source.TRACKER,
+            reported_at=now(),
+            tracker=tracker,
+            geo=Point(float(lng), float(lat), srid=4326),
+        )
         if tracker.bike:
             loc.bike = tracker.bike
-        loc.geo = Point(float(lng), float(lat), srid=4326)
-        loc.tracker = tracker
         if accuracy:
             loc.accuracy = accuracy
         loc.save()
@@ -156,7 +201,8 @@ def updatebikelocation(request):
             # distance ist configured in prefernces
             max_distance = preferences.BikeSharePreferences.station_match_max_distance
             station_closer_than_Xm = Station.objects.filter(
-                location__distance_lte=(loc.geo, D(m=max_distance)), status="AC"
+                location__distance_lte=(loc.geo, D(m=max_distance)),
+                status=Station.Status.ACTIVE,
             ).first()
             if station_closer_than_Xm:
                 bike.current_station = station_closer_than_Xm
@@ -165,10 +211,40 @@ def updatebikelocation(request):
 
         bike.save()
 
+    someminutesago = now() - timedelta(minutes=15)
+    data = {}
+    if loc:
+        data = {"location_id": loc.id}
+
+    if tracker.tracker_status == LocationTracker.Status.MISSING:
+        action_type = "cykel.tracker.missing_reporting"
+        CykelLogEntry.create_unless_time(
+            someminutesago, content_object=tracker, action_type=action_type, data=data
+        )
+
+    if tracker.bike and tracker.bike.state == Bike.State.MISSING:
+        action_type = "cykel.bike.missing_reporting"
+        CykelLogEntry.create_unless_time(
+            someminutesago,
+            content_object=tracker.bike,
+            action_type=action_type,
+            data=data,
+        )
+
     if not loc:
         return Response({"success": True, "warning": "lat/lng missing"})
 
     return Response({"success": True})
+
+
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated, CanUseMaintenancePermission])
+class MaintenanceViewSet(viewsets.ViewSet):
+    @action(detail=False, methods=["GET"])
+    def mapdata(self, request):
+        bikes = Bike.objects.filter(location__isnull=False).distinct()
+        serializer = MaintenanceBikeSerializer(bikes, many=True)
+        return Response(serializer.data)
 
 
 class UserDetailsView(generics.RetrieveAPIView):
@@ -192,7 +268,8 @@ class UserDetailsView(generics.RetrieveAPIView):
 
 @permission_classes([AllowAny])
 class LoginProviderViewSet(
-    mixins.ListModelMixin, viewsets.GenericViewSet,
+    mixins.ListModelMixin,
+    viewsets.GenericViewSet,
 ):
     """return the configured social login providers."""
 

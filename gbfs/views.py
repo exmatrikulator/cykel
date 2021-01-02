@@ -10,12 +10,13 @@ from rest_framework import generics, mixins
 from rest_framework.decorators import permission_classes
 from rest_framework.permissions import AllowAny
 
-from bikesharing.models import Bike, Station
+from bikesharing.models import Bike, Station, VehicleType
 
 from .serializers import (
     GbfsFreeBikeStatusSerializer,
     GbfsStationInformationSerializer,
     GbfsStationStatusSerializer,
+    GbfsVehicleTypeSerializer,
 )
 
 
@@ -39,6 +40,10 @@ def gbfs(request):
                     {
                         "name": "free_bike_status",
                         "url": getGbfsRoot(request) + "free_bike_status.json",
+                    },
+                    {
+                        "name": "vehicle_types",
+                        "url": getGbfsRoot(request) + "vehicle_types.json",
                     },
                 ]
             }
@@ -70,7 +75,7 @@ class GbfsFreeBikeStatusViewSet(mixins.ListModelMixin, generics.GenericAPIView):
         # is older than configure allowed silent timepreiod
         if bsp.gbfs_hide_bikes_after_location_report_silence:
             bikes = Bike.objects.filter(
-                availability_status="AV",
+                availability_status=Bike.Availability.AVAILABLE,
                 last_reported__gte=now()
                 - timedelta(hours=bsp.gbfs_hide_bikes_after_location_report_hours),
                 current_station=None,
@@ -78,7 +83,9 @@ class GbfsFreeBikeStatusViewSet(mixins.ListModelMixin, generics.GenericAPIView):
             ).distinct()
         else:
             bikes = Bike.objects.filter(
-                availability_status="AV", current_station=None, location__isnull=False
+                availability_status=Bike.Availability.AVAILABLE,
+                current_station=None,
+                location__isnull=False,
             ).distinct()
 
         serializer = GbfsFreeBikeStatusSerializer(bikes, many=True)
@@ -91,7 +98,7 @@ class GbfsFreeBikeStatusViewSet(mixins.ListModelMixin, generics.GenericAPIView):
 
 @permission_classes([AllowAny])
 class GbfsStationInformationViewSet(mixins.ListModelMixin, generics.GenericAPIView):
-    queryset = Station.objects.filter(status="AC")
+    queryset = Station.objects.filter(status=Station.Status.ACTIVE)
     serializer_class = GbfsStationInformationSerializer
 
     def get(self, request, *args, **kwargs):
@@ -103,12 +110,25 @@ class GbfsStationInformationViewSet(mixins.ListModelMixin, generics.GenericAPIVi
 
 
 @permission_classes([AllowAny])
+class GbfsVehicleTypeViewSet(mixins.ListModelMixin, generics.GenericAPIView):
+    queryset = VehicleType.objects.all()  # FIXME: get only used
+    serializer_class = GbfsVehicleTypeSerializer
+
+    def get(self, request, *args, **kwargs):
+        vehicle_types = VehicleType.objects.all()
+        serializer = GbfsVehicleTypeSerializer(vehicle_types, many=True)
+        vehicle_type_data = {"vehicle_types": serializer.data}
+        data = getGbfsWithData(vehicle_type_data)
+        return JsonResponse(data, safe=False)
+
+
+@permission_classes([AllowAny])
 class GbfsStationStatusViewSet(mixins.ListModelMixin, generics.GenericAPIView):
-    queryset = Station.objects.filter(status="AC")
+    queryset = Station.objects.filter(status=Station.Status.ACTIVE)
     serializer_class = GbfsStationStatusSerializer
 
     def get(self, request, *args, **kwargs):
-        stations = Station.objects.filter(status="AC")
+        stations = Station.objects.filter(status=Station.Status.ACTIVE)
         serializer = GbfsStationStatusSerializer(stations, many=True)
         station_data = {"stations": serializer.data}
         data = getGbfsWithData(station_data)

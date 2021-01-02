@@ -1,27 +1,42 @@
 from allauth.socialaccount.models import SocialApp
 from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point
-from django.utils.timezone import now
+from django.utils.timezone import now, timedelta
 from rest_framework import serializers
 
-from bikesharing.models import Bike, Location, LocationTracker, Lock, Rent, Station
+from bikesharing.models import (
+    Bike,
+    Location,
+    LocationTracker,
+    Lock,
+    LockType,
+    Rent,
+    Station,
+)
+from cykel.models import CykelLogEntry
+from cykel.serializers import MappedChoiceField
+
+
+class LockTypeSerializer(serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = LockType
+        fields = ("name",)
 
 
 class LockSerializer(serializers.HyperlinkedModelSerializer):
+    form_factor = serializers.ReadOnlyField(source="lock_type.form_factor")
+
     class Meta:
         model = Lock
-        fields = ("mac_address", "unlock_key", "lock_type")
+        fields = ("unlock_key", "form_factor")
 
 
 class BikeSerializer(serializers.HyperlinkedModelSerializer):
-    lock = LockSerializer()
+    lock_type = serializers.ReadOnlyField(source="lock.lock_type.form_factor")
 
     class Meta:
         model = Bike
-        fields = (
-            "bike_number",
-            "lock",
-        )
+        fields = ("bike_number", "lock_type")
 
 
 class StationSerializer(serializers.HyperlinkedModelSerializer):
@@ -56,42 +71,39 @@ class CreateRentSerializer(serializers.HyperlinkedModelSerializer):
         return Rent.objects.create(**data)
 
     def save(self, **kwargs):
-        super().save(**kwargs)
-        # FIXME: This method contains too much self.instance. doesn't feel good.
-        # Should this stuff go into the model?
-        self.instance.bike.availability_status = "IU"
-        self.instance.bike.save()
-
+        bike = self.validated_data["bike"]
         if (
             self.validated_data.get("lat") is not None
             and self.validated_data.get("lng") is not None
         ):
             pos = Point(
-                float(self.validated_data.get("lng")),
-                float(self.validated_data.get("lat")),
+                float(self.validated_data["lng"]),
+                float(self.validated_data["lat"]),
                 srid=4326,
             )
-            self.instance.start_position = pos
 
             loc = Location.objects.create(
-                bike=self.instance.bike, source="US", reported_at=now()
+                bike=bike,
+                source=Location.Source.USER,
+                reported_at=now(),
+                geo=pos,
             )
-            loc.geo = pos
-            loc.save()
+            self.validated_data["start_location"] = loc
         else:
-            if self.instance.bike.public_geolocation():
-                self.instance.start_position = (
-                    self.instance.bike.public_geolocation().geo
-                )
-            if self.instance.bike.current_station:
-                self.instance.start_station = self.instance.bike.current_station
+            if bike.public_geolocation():
+                self.validated_data["start_location"] = bike.public_geolocation()
+            if bike.current_station:
+                self.validated_data["start_station"] = bike.current_station
 
-        self.instance.save()
+        super().save(**kwargs)
+
+        bike.availability_status = Bike.Availability.IN_USE
+        bike.save()
 
     def validate_bike(self, value):
         # seems there is no way to get the already validated and expanded bike obj
         bike = Bike.objects.get(bike_number=value)
-        if bike.availability_status != "AV":
+        if bike.availability_status != Bike.Availability.AVAILABLE:
             raise serializers.ValidationError("bike is not available")
         return value
 
@@ -106,9 +118,12 @@ class CreateRentSerializer(serializers.HyperlinkedModelSerializer):
 class RentSerializer(serializers.HyperlinkedModelSerializer):
     bike = BikeSerializer(read_only=True)
 
+    finish_url = serializers.HyperlinkedIdentityField(view_name="rent-finish")
+    unlock_url = serializers.HyperlinkedIdentityField(view_name="rent-unlock")
+
     class Meta:
         model = Rent
-        fields = ["id", "bike", "rent_start"]
+        fields = ["url", "id", "bike", "rent_start", "finish_url", "unlock_url"]
 
 
 class SocialAppSerializer(serializers.HyperlinkedModelSerializer):
@@ -139,6 +154,41 @@ class LocationTrackerUpdateSerializer(serializers.ModelSerializer):
         self.instance.last_reported = now()
         super().save()
 
+        if (
+            self.instance.battery_voltage is not None
+            and self.instance.tracker_type is not None
+        ):
+            data = {"voltage": self.instance.battery_voltage}
+            action_type = None
+            action_type_prefix = "cykel.tracker"
+
+            if self.instance.bike:
+                data["bike_id"] = self.instance.bike.pk
+                action_type_prefix = "cykel.bike.tracker"
+
+            if (
+                self.instance.tracker_type.battery_voltage_critical is not None
+                and self.instance.battery_voltage
+                <= self.instance.tracker_type.battery_voltage_critical
+            ):
+                action_type = "battery.critical"
+            elif (
+                self.instance.tracker_type.battery_voltage_warning is not None
+                and self.instance.battery_voltage
+                <= self.instance.tracker_type.battery_voltage_warning
+            ):
+                action_type = "battery.warning"
+
+            if action_type is not None:
+                action_type = "{}.{}".format(action_type_prefix, action_type)
+                somehoursago = now() - timedelta(hours=48)
+                CykelLogEntry.create_unless_time(
+                    somehoursago,
+                    content_object=self.instance,
+                    action_type=action_type,
+                    data=data,
+                )
+
     def validate(self, data):
         if (data.get("lat") is None and data.get("lng") is not None) or (
             data.get("lat") is not None and data.get("lng") is None
@@ -162,3 +212,80 @@ class UserDetailsSerializer(serializers.ModelSerializer):
     class Meta:
         model = get_user_model()
         fields = ("pk", "username", "can_rent_bike")
+
+
+class MaintenanceBikeSerializer(serializers.ModelSerializer):
+    bike_id = serializers.CharField(source="non_static_bike_uuid", read_only=True)
+    availability_status = MappedChoiceField(choices=Bike.Availability)
+    state = MappedChoiceField(choices=Bike.State)
+
+    class Meta:
+        model = Bike
+        fields = (
+            "bike_id",
+            "bike_number",
+            "state",
+            "availability_status",
+            "internal_note",
+        )
+
+    def to_representation(self, instance):
+        representation = super().to_representation(instance)
+
+        trackerserializer = MaintenanceTrackerSerializer(
+            instance.locationtracker_set.all(), many=True
+        )
+        representation["trackers"] = trackerserializer.data
+        lockserializer = MaintenanceLockSerializer(instance.lock)
+        representation["lock"] = lockserializer.data
+
+        public_geolocation = instance.public_geolocation()
+        if public_geolocation is not None:
+            pos = public_geolocation.geo
+            if pos and pos.x and pos.y:
+                representation["lat"] = pos.y
+                representation["lng"] = pos.x
+        return representation  # only return bikes with public geolocation
+
+
+class MaintenanceTrackerSerializer(serializers.ModelSerializer):
+    tracker_status = MappedChoiceField(choices=LocationTracker.Status)
+    tracker_type = serializers.StringRelatedField()
+
+    class Meta:
+        model = LocationTracker
+        fields = (
+            "device_id",
+            "battery_voltage",
+            "internal",
+            "last_reported",
+            "tracker_type",
+            "tracker_status",
+        )
+
+    def to_representation(self, instance):
+        representation = super().to_representation(instance)
+        current_location = instance.current_geolocation()
+        if current_location:
+            representation["last_location_reported"] = current_location.reported_at
+            current_geolocation = current_location.geo
+            if current_geolocation and current_geolocation.x and current_geolocation.y:
+                representation["lat"] = current_geolocation.y
+                representation["lng"] = current_geolocation.x
+        return representation
+
+
+class MaintenanceLockTypeSerializer(serializers.ModelSerializer):
+    form_factor = MappedChoiceField(choices=LockType.FormFactor)
+
+    class Meta:
+        model = LockType
+        fields = ("name", "form_factor")
+
+
+class MaintenanceLockSerializer(serializers.ModelSerializer):
+    lock_type = MaintenanceLockTypeSerializer()
+
+    class Meta:
+        model = Lock
+        fields = ("unlock_key", "lock_type", "lock_id")
