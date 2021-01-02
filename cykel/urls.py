@@ -28,4 +28,5 @@ urlpatterns = [
     path("bikesharing/", include("bikesharing.urls")),
     path("gbfs/", include("gbfs.urls")),
     url(r"^auth/", include("allauth.urls")),
-] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT) \
++ static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
