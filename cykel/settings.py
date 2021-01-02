@@ -68,6 +68,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "leaflet",
     "preferences",
+    'import_export',
 ]
 
 SITE_ID = 1

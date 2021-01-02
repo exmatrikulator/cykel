@@ -4,6 +4,7 @@ from django.utils import formats, timezone
 from django.utils.safestring import mark_safe
 from leaflet.admin import LeafletGeoAdmin
 from preferences.admin import PreferencesAdmin
+from import_export.admin import ImportExportModelAdmin
 
 from .models import (
     Bike,
@@ -27,7 +28,7 @@ class LocationAdmin(LeafletGeoAdmin, admin.ModelAdmin):
 
 
 @admin.register(Bike)
-class BikeAdmin(LeafletGeoAdmin, admin.ModelAdmin):
+class BikeAdmin(LeafletGeoAdmin, ImportExportModelAdmin, admin.ModelAdmin):
     list_display = (
         "bike_number",
         "bike_type",
@@ -128,6 +129,12 @@ class LocationTrackerAdmin(LeafletGeoAdmin, admin.ModelAdmin):
     location.allow_tags = True
 
 
-admin.site.register(Lock, LeafletGeoAdmin)
-admin.site.register(Station, LeafletGeoAdmin)
+@admin.register(Lock)
+class LockAdmin(LeafletGeoAdmin, ImportExportModelAdmin, admin.ModelAdmin):
+    pass
+
+@admin.register(Station)
+class StationAdmin(LeafletGeoAdmin, ImportExportModelAdmin, admin.ModelAdmin):
+    pass
+
 admin.site.register(BikeSharePreferences, PreferencesAdmin)
