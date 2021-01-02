@@ -206,3 +206,10 @@ if SENTRY_DSN is not None:
     sentry_sdk.init(
         dsn=SENTRY_DSN, integrations=[DjangoIntegration()],
     )
+
+
+LEAFLET_CONFIG = {
+'DEFAULT_CENTER': (51.2583, 7.1981),
+'DEFAULT_ZOOM': 12,
+'TILES': [('Test', 'https://osm-demo-{s}.wheregroup.com/tiles/1.0.0/osm/webmercator/{z}/{x}/{y}.png', {'subdomains':['a','b','c']})]
+}
